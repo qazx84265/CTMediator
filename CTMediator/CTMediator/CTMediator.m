@@ -7,6 +7,13 @@
 //
 
 #import "CTMediator.h"
+#import <objc/runtime.h>
+
+@interface CTMediator ()
+
+@property (nonatomic, strong) NSMutableDictionary *cachedTarget;
+
+@end
 
 @implementation CTMediator
 
@@ -30,12 +37,6 @@
 
 - (id)performActionWithUrl:(NSURL *)url completion:(void (^)(NSDictionary *))completion
 {
-#warning todo 修改aaa为你自己app的scheme
-    if (![url.scheme isEqualToString:@"aaa"]) {
-        // 这里就是针对远程app调用404的简单处理了，根据不同app的产品经理要求不同，你们可以在这里自己做需要的逻辑
-        return @(NO);
-    }
-    
     NSMutableDictionary *params = [[NSMutableDictionary alloc] init];
     NSString *urlString = [url query];
     for (NSString *param in [urlString componentsSeparatedByString:@"&"]) {
@@ -51,7 +52,7 @@
     }
     
     // 这个demo针对URL的路由处理非常简单，就只是取对应的target名字和method名字，但这已经足以应对绝大部份需求。如果需要拓展，可以在这个方法调用之前加入完整的路由逻辑
-    id result = [self performTarget:url.host action:actionName params:params];
+    id result = [self performTarget:url.host action:actionName params:params shouldCacheTarget:NO];
     if (completion) {
         if (result) {
             completion(@{@"result":result});
@@ -62,14 +63,19 @@
     return result;
 }
 
-- (id)performTarget:(NSString *)targetName action:(NSString *)actionName params:(NSDictionary *)params
+- (id)performTarget:(NSString *)targetName action:(NSString *)actionName params:(NSDictionary *)params shouldCacheTarget:(BOOL)shouldCacheTarget
 {
     
     NSString *targetClassString = [NSString stringWithFormat:@"Target_%@", targetName];
-    NSString *actionString = [NSString stringWithFormat:@"Action_%@:", actionName];
+    NSString *actionString = [NSString stringWithFormat:@"Action_%@", actionName];
+    Class targetClass;
     
-    Class targetClass = NSClassFromString(targetClassString);
-    id target = [[targetClass alloc] init];
+    NSObject *target = self.cachedTarget[targetClassString];
+    if (target == nil) {
+        targetClass = NSClassFromString(targetClassString);
+        target = [[targetClass alloc] init];
+    }
+    
     SEL action = NSSelectorFromString(actionString);
     
     if (target == nil) {
@@ -77,24 +83,87 @@
         return nil;
     }
     
-    if ([target respondsToSelector:action]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        return [target performSelector:action withObject:params];
-#pragma clang diagnostic pop
-    } else {
-        // 这里是处理无响应请求的地方，如果无响应，则尝试调用对应target的notFound方法统一处理
-        SEL action = NSSelectorFromString(@"notFound:");
-        if ([target respondsToSelector:action]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-            return [target performSelector:action withObject:params];
-#pragma clang diagnostic pop
-        } else {
-            // 这里也是处理无响应请求的地方，在notFound都没有的时候，这个demo是直接return了。实际开发过程中，可以用前面提到的固定的target顶上的。
-            return nil;
-        }
+    if (shouldCacheTarget) {
+        self.cachedTarget[targetClassString] = target;
     }
+    
+    //    if ([target respondsToSelector:action]) {
+    //#pragma clang diagnostic push
+    //#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    //        return [target performSelector:action withObject:params];
+    //#pragma clang diagnostic pop
+    //    } else {
+    //        // 有可能target是Swift对象
+    //        actionString = [NSString stringWithFormat:@"Action_%@WithParams:", actionName];
+    //        action = NSSelectorFromString(actionString);
+    //        if ([target respondsToSelector:action]) {
+    //#pragma clang diagnostic push
+    //#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    //            return [target performSelector:action withObject:params];
+    //#pragma clang diagnostic pop
+    //        } else {
+    //            // 这里是处理无响应请求的地方，如果无响应，则尝试调用对应target的notFound方法统一处理
+    //            SEL action = NSSelectorFromString(@"notFound:");
+    //            if ([target respondsToSelector:action]) {
+    //#pragma clang diagnostic push
+    //#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    //                return [target performSelector:action withObject:params];
+    //#pragma clang diagnostic pop
+    //            } else {
+    //                // 这里也是处理无响应请求的地方，在notFound都没有的时候，这个demo是直接return了。实际开发过程中，可以用前面提到的固定的target顶上的。
+    //                [self.cachedTarget removeObjectForKey:targetClassString];
+    //                return nil;
+    //            }
+    //        }
+    //    }
+    
+    //--fb
+    if ([target respondsToSelector:action]) {
+        return [self target:target selector:action params:params];
+    }
+    //--
+    actionString = [actionString stringByAppendingString:@":"];
+    action = NSSelectorFromString(actionString);
+    if ([target respondsToSelector:action]) {
+        return [self target:target selector:action params:params];
+    }
+    //--
+    // 有可能target是Swift对象
+    actionString = [NSString stringWithFormat:@"Action_%@WithParams:", actionName];
+    action = NSSelectorFromString(actionString);
+    if ([target respondsToSelector:action]) {
+        return [self target:target selector:action params:params];
+    }
+    // 这里是处理无响应请求的地方，如果无响应，则尝试调用对应target的notFound方法统一处理
+    action = NSSelectorFromString(@"notFound:");
+    if ([target respondsToSelector:action]) {
+        return [self target:target selector:action params:params];
+    }
+    // 这里也是处理无响应请求的地方，在notFound都没有的时候，这个demo是直接return了。实际开发过程中，可以用前面提到的固定的target顶上的。
+    [self.cachedTarget removeObjectForKey:targetClassString];
+    return nil;
+}
+
+- (id)target:(id)target selector:(SEL)sel params:(id)params {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    return [target performSelector:sel withObject:params];
+#pragma clang diagnostic pop
+}
+
+- (void)releaseCachedTargetWithTargetName:(NSString *)targetName
+{
+    NSString *targetClassString = [NSString stringWithFormat:@"Target_%@", targetName];
+    [self.cachedTarget removeObjectForKey:targetClassString];
+}
+
+#pragma mark - getters and setters
+- (NSMutableDictionary *)cachedTarget
+{
+    if (_cachedTarget == nil) {
+        _cachedTarget = [[NSMutableDictionary alloc] init];
+    }
+    return _cachedTarget;
 }
 
 @end
